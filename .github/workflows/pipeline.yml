@@ -1,0 +1,155 @@
+name: CI/CD EKS Innovatech
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  AWS_REGION: us-east-1
+  CLUSTER_NAME: devopseks
+
+jobs:
+
+  build-and-push:
+    name: Build y Push ECR
+    runs-on: ubuntu-latest
+
+    outputs:
+      account_id: ${{ steps.account.outputs.account_id }}
+
+    steps:
+      - name: Descargar código
+        uses: actions/checkout@v4
+
+      - name: Configurar AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Obtener Account ID
+        id: account
+        run: |
+          echo "account_id=$(aws sts get-caller-identity --query Account --output text)" >> $GITHUB_OUTPUT
+
+      - name: Login ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Construir Frontend
+        run: |
+          docker build -t tienda-frontend ./frontend
+
+      - name: Etiquetar Frontend
+        run: |
+          docker tag tienda-frontend:latest \
+          ${{ steps.account.outputs.account_id }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/tienda-frontend:eks-v1
+
+      - name: Push Frontend
+        run: |
+          docker push \
+          ${{ steps.account.outputs.account_id }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/tienda-frontend:eks-v1
+
+      - name: Construir Backend
+        run: |
+          docker build -t tienda-backend ./backend
+
+      - name: Etiquetar Backend
+        run: |
+          docker tag tienda-backend:latest \
+          ${{ steps.account.outputs.account_id }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/tienda-backend:eks-v1
+
+      - name: Push Backend
+        run: |
+          docker push \
+          ${{ steps.account.outputs.account_id }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/tienda-backend:eks-v1
+
+      - name: Construir DB
+        run: |
+          docker build -t tienda-db ./db
+
+      - name: Etiquetar DB
+        run: |
+          docker tag tienda-db:latest \
+          ${{ steps.account.outputs.account_id }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/tienda-db:eks-v1
+
+      - name: Push DB
+        run: |
+          docker push \
+          ${{ steps.account.outputs.account_id }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/tienda-db:eks-v1
+
+  deploy:
+    name: Deploy EKS
+    needs: build-and-push
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Descargar código
+        uses: actions/checkout@v4
+
+      - name: Configurar AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Instalar kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Configurar acceso EKS
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ secrets.AWS_REGION }} \
+            --name devopseks
+
+      - name: Reemplazar ECR_URL
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+
+          find ./k8s -type f -name "*.yaml" \
+          -exec sed -i "s|{{ECR_URL}}|${ACCOUNT_ID}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com|g" {} \;
+
+      - name: Desplegar Namespace
+        run: kubectl apply -f ./k8s/namespace.yaml
+
+      - name: Desplegar MySQL
+        run: |
+          kubectl apply -f ./k8s/mysql-secret.yaml
+          kubectl apply -f ./k8s/mysql-deployment.yaml
+          kubectl apply -f ./k8s/mysql-service.yaml
+
+      - name: Esperar MySQL
+        run: |
+          kubectl rollout status deployment/tienda-db -n tienda --timeout=300s
+
+      - name: Desplegar Backend
+        run: |
+          kubectl apply -f ./k8s/backend-deployment.yaml
+          kubectl apply -f ./k8s/backend-service.yaml
+
+      - name: Esperar Backend
+        run: |
+          kubectl rollout status deployment/tienda-backend -n tienda --timeout=300s
+
+      - name: Desplegar Frontend
+        run: |
+          kubectl apply -f ./k8s/frontend-deployment.yaml
+          kubectl apply -f ./k8s/frontend-service.yaml
+
+      - name: Esperar Frontend
+        run: |
+          kubectl rollout status deployment/tienda-frontend -n tienda --timeout=300s
+
+      - name: Configurar HPA
+        run: |
+          kubectl apply -f ./k8s/backend-hpa.yaml
+          kubectl apply -f ./k8s/frontend-hpa.yaml
+
+      - name: Verificar recursos
+        run: |
+          kubectl get all -n tienda
+          kubectl get hpa -n tienda
